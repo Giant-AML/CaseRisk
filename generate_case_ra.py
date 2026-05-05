@@ -238,6 +238,70 @@ def fetch_filing_count(company_number: str, api_key: str) -> dict:
         "latest_accounts_date": accounts[0].get("date", "") if accounts else "",
     }
 
+def fetch_officer_appointments(name: str, api_key: str, subject_company: str = "") -> dict:
+    """Search CH for an officer by name; return all their company appointments.
+
+    Returns a dict:
+      name, total, active, resigned, appointments (list of dicts), match_note, error
+    """
+    import urllib.parse
+    result = {
+        "name": name, "total": 0, "active": 0, "resigned": 0,
+        "appointments": [], "match_note": "", "error": None,
+    }
+    try:
+        q = urllib.parse.quote(name)
+        data = ch_get(f"/search/officers?q={q}&items_per_page=20", api_key) or {}
+        items = data.get("items", [])
+        if not items:
+            result["error"] = "No officer record found on CH"
+            return result
+
+        # Prefer exact name match; fall back to first result
+        best = None
+        for item in items:
+            if item.get("title", "").upper().strip() == name.upper().strip():
+                best = item
+                break
+        if not best:
+            best = items[0]
+            best_name = best.get("title", "")
+            if best_name.upper() != name.upper():
+                result["match_note"] = f"Closest CH match: {best_name}"
+
+        # The links.self from officer search = /officers/{officer_id}
+        self_link = best.get("links", {}).get("self", "")
+        if not self_link:
+            result["error"] = "No officer link available"
+            return result
+
+        appt_data = ch_get(f"{self_link}/appointments?items_per_page=50", api_key) or {}
+        result["total"] = appt_data.get("total_results", 0)
+
+        for item in appt_data.get("items", []):
+            resigned = item.get("resigned_on", "")
+            status   = item.get("appointed_to", {}).get("company_status", "")
+            appt = {
+                "company_name":   item.get("appointed_to", {}).get("company_name", ""),
+                "company_number": item.get("appointed_to", {}).get("company_number", ""),
+                "company_status": status or ("active" if not resigned else "unknown"),
+                "role":           item.get("officer_role", "").replace("-", " ").title(),
+                "appointed":      item.get("appointed_on", ""),
+                "resigned":       resigned,
+                "active":         not bool(resigned),
+            }
+            result["appointments"].append(appt)
+            if not resigned:
+                result["active"] += 1
+            else:
+                result["resigned"] += 1
+
+        return result
+
+    except Exception as e:
+        result["error"] = str(e)
+        return result
+
 # ─── python-docx helpers ──────────────────────────────────────────────────────
 
 def hex_to_rgb(hex_str: str):
@@ -593,10 +657,33 @@ def sic_desc(code: str) -> str:
 
 def build_document(company_data: dict, officers: dict, pscs: list,
                    filing: dict, case_inputs: dict,
-                   adverse_findings: list = None) -> Document:
+                   adverse_findings: list = None,
+                   directorships: dict = None) -> Document:
 
     if adverse_findings is None:
         adverse_findings = []
+    if directorships is None:
+        directorships = {}
+
+    # Build directorships summary string for the ch_rows table
+    if directorships:
+        parts = []
+        for person, appts in directorships.items():
+            active  = sum(1 for a in appts if a.get("active"))
+            total   = len(appts)
+            dissolved = sum(1 for a in appts if "dissolv" in a.get("company_status","").lower())
+            insolv    = sum(1 for a in appts if any(
+                w in a.get("company_status","").lower()
+                for w in ("liquidat","administrat","receivership","voluntary")))
+            note = f"{person}: {active} current, {total} total"
+            if dissolved:
+                note += f", {dissolved} dissolved"
+            if insolv:
+                note += f", {insolv} insolvent/in-procedure"
+            parts.append(note)
+        _directorships_summary = " | ".join(parts)
+    else:
+        _directorships_summary = "Not checked"
 
     doc = Document()
 
@@ -713,13 +800,53 @@ def build_document(company_data: dict, officers: dict, pscs: list,
         ("Former Director(s)",             res_dirs,                                    True),
         ("Persons of Significant Control", psc_str,                                     True),
         ("Share Capital & Ownership",      "See CH filing — confirm with latest accounts", False),
-        ("Associated / Related Companies", "Search director names at CH for cross-directorships", False),
+        ("Associated / Related Companies", _directorships_summary, bool(_directorships_summary and _directorships_summary != "Not checked")),
         ("CH Flags / Concerns",            "e.g. late filings, dormancy gaps, frequent officer changes", False),
     ]
     label_input_with_data(doc, ch_rows, label_cm=5.5)
     doc.add_paragraph()
     narrative_box(doc, "CH Summary — Narrative Observations (key concerns, flags, background)", height_rows=4)
     doc.add_paragraph()
+
+    # ── Directorships detail table ─────────────────────────────────────────────
+    if directorships:
+        guidance(doc,
+            "Cross-directorships sourced from Companies House. Current appointments highlighted. "
+            "Multiple dissolved or insolvent companies are a risk indicator requiring narrative explanation.")
+        dir_cols = [
+            {"label": "Principal",      "width": 3.0},
+            {"label": "Company",        "width": 4.5},
+            {"label": "Co. No.",        "width": 1.4},
+            {"label": "Status",         "width": 1.8},
+            {"label": "Role",           "width": 2.0},
+            {"label": "Appointed",      "width": 1.6},
+            {"label": "Resigned",       "width": 1.62},
+        ]
+        # 3.0+4.5+1.4+1.8+2.0+1.6+1.62 = 15.92
+        dir_widths = [cd["width"] for cd in dir_cols]
+        dir_table = doc.add_table(rows=0, cols=len(dir_cols))
+        dir_table.alignment = WD_TABLE_ALIGNMENT.LEFT
+        hdr_row(dir_table, [(cd["label"], cd["width"]) for cd in dir_cols],
+                bg=C.LIGHT_BLUE, text_color=C.BLACK)
+        for person, appt_list in directorships.items():
+            for appt in appt_list:
+                is_active = appt.get("active", False)
+                row = dir_table.add_row()
+                vals = [
+                    person,
+                    appt.get("company_name", ""),
+                    appt.get("company_number", ""),
+                    appt.get("company_status", "").replace("-", " ").title(),
+                    appt.get("role", ""),
+                    appt.get("appointed", ""),
+                    appt.get("resigned", "") or "Current",
+                ]
+                for i, (val, wd) in enumerate(zip(vals, dir_widths)):
+                    c = row.cells[i]
+                    bg = C.LIGHT_BLUE if is_active else None
+                    write_cell(c, val, size_pt=9, valign="top", bg_hex=bg)
+                    set_col_width(c, wd)
+        doc.add_paragraph()
 
     # ── SECTION 2 — SECTOR RISK ───────────────────────────────────────────────
     section_banner(doc, 2, "Industry Sector Risk Assessment")
